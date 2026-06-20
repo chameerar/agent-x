@@ -81,7 +81,6 @@ That loop *is* the agent. Frameworks dress it up; this is the core.
 main.go        Client (HTTP to Ollama), Agent (the loop), CLI, config
 tools.go       Tool/Toolbox types and the three tool implementations
 tools_test.go  Unit tests (calculator + the read_file sandbox guard)
-PLAN.md        The phased learning roadmap this was built against
 ```
 
 ## Testing
@@ -112,4 +111,4 @@ improves sharply with larger models; small 3B models often guess instead.
 
 ---
 
-*A personal learning project — built phase by phase. See `PLAN.md` for the roadmap.*
+*A personal learning project — built phase by phase.*

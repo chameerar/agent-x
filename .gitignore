@@ -5,3 +5,6 @@
 *.exe
 *.test
 *.out
+
+# Personal notes, not tracked
+PLAN.md
