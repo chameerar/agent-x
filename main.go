@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const defaultSystemPrompt = "You are Gopher, a concise and friendly assistant. " +
+const defaultSystemPrompt = "You are Agent X, a concise and friendly assistant. " +
 	"You have three tools: calculator (arithmetic), current_time (the date/time), " +
 	"and read_file (read a file from the sandbox).\n" +
 	"Rules:\n" +

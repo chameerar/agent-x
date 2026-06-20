@@ -1,4 +1,4 @@
-# Gopher — a tiny AI agent in Go, from scratch
+# Agent X — a tiny AI agent in Go, from scratch
 
 A learning project: a command-line AI agent built **from scratch in Go**, talking
 to a **local LLM via [Ollama](https://ollama.com)** — no agent framework, just
