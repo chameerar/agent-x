@@ -3,6 +3,13 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
 )
 
 // ToolSpec is the definition we hand to the model so it knows a tool exists.
@@ -46,6 +53,16 @@ func (tb *Toolbox) Specs() []ToolSpec {
 		specs = append(specs, t.Spec)
 	}
 	return specs
+}
+
+// Names returns the registered tool names (sorted), for banners and errors.
+func (tb *Toolbox) Names() []string {
+	names := make([]string, 0, len(tb.tools))
+	for name := range tb.tools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // Run executes the named tool with the given arguments.
@@ -112,8 +129,95 @@ func runCalculator(args map[string]any) (string, error) {
 	return fmt.Sprintf("%v", result), nil
 }
 
+// currentTimeTool reports the current time — something the model can't know on
+// its own. It takes no arguments.
+func currentTimeTool() Tool {
+	return Tool{
+		Spec: ToolSpec{
+			Type: "function",
+			Function: ToolFunction{
+				Name:        "current_time",
+				Description: "Get the current local date and time.",
+				Parameters: map[string]any{
+					"type":       "object",
+					"properties": map[string]any{},
+				},
+			},
+		},
+		Run: func(map[string]any) (string, error) {
+			return time.Now().Format("2006-01-02 15:04:05 MST"), nil
+		},
+	}
+}
+
+// maxFileBytes bounds how much of a file we'll read, so a huge file can't
+// exhaust memory or blow past the model's context window.
+const maxFileBytes = 8 * 1024
+
+// readFileTool reads a text file, but ONLY within baseDir. The model is
+// untrusted input: it may ask for "../../etc/passwd", so every path is resolved
+// and checked to stay inside the sandbox before we touch the disk.
+func readFileTool(baseDir string) Tool {
+	return Tool{
+		Spec: ToolSpec{
+			Type: "function",
+			Function: ToolFunction{
+				Name:        "read_file",
+				Description: "Read a UTF-8 text file from the sandbox directory. Provide a relative path.",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"path": map[string]any{
+							"type":        "string",
+							"description": "Path to the file, relative to the sandbox directory.",
+						},
+					},
+					"required": []string{"path"},
+				},
+			},
+		},
+		Run: func(args map[string]any) (string, error) {
+			rel, _ := args["path"].(string)
+			return readFileInDir(baseDir, rel)
+		},
+	}
+}
+
+func readFileInDir(baseDir, rel string) (string, error) {
+	if strings.TrimSpace(rel) == "" {
+		return "", fmt.Errorf("path is required")
+	}
+
+	base, err := filepath.Abs(baseDir)
+	if err != nil {
+		return "", fmt.Errorf("resolving sandbox: %w", err)
+	}
+
+	// Join then verify the result is still inside base. filepath.Join cleans
+	// the path, so a "../" in rel resolves here and the prefix check catches
+	// any escape attempt.
+	full := filepath.Join(base, rel)
+	if full != base && !strings.HasPrefix(full, base+string(os.PathSeparator)) {
+		return "", fmt.Errorf("access denied: %q is outside the sandbox", rel)
+	}
+
+	f, err := os.Open(full)
+	if err != nil {
+		return "", fmt.Errorf("opening file: %w", err)
+	}
+	defer f.Close()
+
+	// Bounded read: never pull more than maxFileBytes into memory.
+	data, err := io.ReadAll(io.LimitReader(f, maxFileBytes))
+	if err != nil {
+		return "", fmt.Errorf("reading file: %w", err)
+	}
+	return string(data), nil
+}
+
 // toFloat coerces a JSON-decoded value into a float64. JSON numbers decode to
-// float64, but we accept a couple of other shapes defensively.
+// float64, but models often send numbers as strings ("10"), so we accept those
+// too — coercing loosely-typed model output is a normal part of tool hardening.
 func toFloat(v any) (float64, bool) {
 	switch n := v.(type) {
 	case float64:
@@ -123,6 +227,9 @@ func toFloat(v any) (float64, bool) {
 		return f, err == nil
 	case int:
 		return float64(n), true
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(n), 64)
+		return f, err == nil
 	default:
 		return 0, false
 	}

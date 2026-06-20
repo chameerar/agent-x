@@ -1,0 +1,7 @@
+# Compiled binary (built with `go build`)
+/ai-agent
+
+# Go test / build artifacts
+*.exe
+*.test
+*.out

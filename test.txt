@@ -1,0 +1,1 @@
+10 divided by 4 and multply by the number of minutes passed in the current time

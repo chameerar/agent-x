@@ -15,8 +15,17 @@ import (
 )
 
 const defaultSystemPrompt = "You are Gopher, a concise and friendly assistant. " +
-	"You have tools available — use the calculator tool for any arithmetic " +
-	"instead of computing it yourself. Keep answers short."
+	"You have three tools: calculator (arithmetic), current_time (the date/time), " +
+	"and read_file (read a file from the sandbox).\n" +
+	"Rules:\n" +
+	"- NEVER guess or make up a value that a tool can give you. Use calculator " +
+	"for ALL arithmetic, current_time for the date/time, and read_file for file " +
+	"contents — even if you think you know the answer.\n" +
+	"- If a task needs several steps (e.g. read a file, then get the time, then " +
+	"calculate), call the tools one at a time, using each result, before you answer.\n" +
+	"- Do not call a tool just to demonstrate it, and do not invent file paths.\n" +
+	"- If asked what tools you have, describe them in words instead of calling them.\n" +
+	"Keep answers short."
 
 // maxToolIterations caps how many tool round-trips one user turn may trigger,
 // so a confused model can't loop forever.
@@ -52,9 +61,10 @@ type chatResponse struct {
 }
 
 type Config struct {
-	Host   string
-	Model  string
-	System string
+	Host    string
+	Model   string
+	System  string
+	Sandbox string
 }
 
 type Client struct {
@@ -105,6 +115,7 @@ func parseConfig() Config {
 	flag.StringVar(&cfg.Host, "host", envOr("OLLAMA_HOST", "http://localhost:11434"), "Ollama server URL")
 	flag.StringVar(&cfg.Model, "model", envOr("OLLAMA_MODEL", "llama3.2"), "model name")
 	flag.StringVar(&cfg.System, "system", defaultSystemPrompt, "system prompt")
+	flag.StringVar(&cfg.Sandbox, "sandbox", ".", "directory the read_file tool is restricted to")
 	flag.Parse()
 	return cfg
 }
@@ -158,17 +169,20 @@ func (a *Agent) Ask(ctx context.Context, input string) (string, error) {
 		}
 		a.history = append(a.history, reply)
 
-		// No tool calls means the model is done — return its answer.
 		if len(reply.ToolCalls) == 0 {
+			if looksLikeToolCallLeak(reply.Content) {
+				a.history = append(a.history, Message{
+					Role:    "user",
+					Content: "Please answer in plain text, or make a proper tool call.",
+				})
+				continue
+			}
 			return reply.Content, nil
 		}
 
-		// Otherwise run each requested tool and feed the results back in.
+		// Run each requested tool and feed the results back in.
 		for _, call := range reply.ToolCalls {
-			result, err := a.toolbox.Run(call.Function.Name, call.Function.Arguments)
-			if err != nil {
-				result = "error: " + err.Error()
-			}
+			result := a.runToolCall(call)
 			fmt.Printf("  [tool] %s(%v) => %s\n", call.Function.Name, call.Function.Arguments, result)
 			a.history = append(a.history, Message{
 				Role:     "tool",
@@ -178,16 +192,47 @@ func (a *Agent) Ask(ctx context.Context, input string) (string, error) {
 		}
 	}
 
-	return "", fmt.Errorf("gave up after %d tool iterations", maxToolIterations)
+	// Exhausted the tool budget. Don't crash the session — return gracefully.
+	return "I got stuck trying to use my tools. Could you rephrase that?", nil
+}
+
+// runToolCall executes one tool call. Unknown tools and tool errors are turned
+// into messages the model can read and recover from — never a crash. The error
+// text lists the real tools so the model can correct itself.
+func (a *Agent) runToolCall(call ToolCall) string {
+	result, err := a.toolbox.Run(call.Function.Name, call.Function.Arguments)
+	if err != nil {
+		return fmt.Sprintf("error: %v (available tools: %s)", err, strings.Join(a.toolbox.Names(), ", "))
+	}
+	return result
+}
+
+func looksLikeToolCallLeak(content string) bool {
+	trimmed := strings.TrimSpace(content)
+	if !strings.HasPrefix(trimmed, "{") {
+		return false
+	}
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &probe); err != nil {
+		return false
+	}
+	_, hasName := probe["name"]
+	_, hasParams := probe["parameters"]
+	return hasName && hasParams
 }
 
 func run() error {
 	cfg := parseConfig()
 	client := NewClient(cfg.Host, cfg.Model)
-	toolbox := NewToolbox(calculatorTool())
+	toolbox := NewToolbox(
+		calculatorTool(),
+		currentTimeTool(),
+		readFileTool(cfg.Sandbox),
+	)
 	agent := NewAgent(client, toolbox, cfg.System)
 
-	fmt.Printf("Chat with %s (tools: calculator). Type 'exit' or Ctrl-D to quit.\n", cfg.Model)
+	fmt.Printf("Chat with %s (tools: %s). Type 'exit' or Ctrl-D to quit.\n",
+		cfg.Model, strings.Join(toolbox.Names(), ", "))
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
@@ -207,7 +252,9 @@ func run() error {
 		answer, err := agent.Ask(ctx, input)
 		cancel()
 		if err != nil {
-			return err
+			// One failed turn (timeout, server hiccup) shouldn't end the chat.
+			fmt.Fprintf(os.Stderr, "  (turn failed: %v)\n", err)
+			continue
 		}
 
 		fmt.Printf("AI:  %s\n", strings.TrimSpace(answer))
