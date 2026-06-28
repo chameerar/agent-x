@@ -65,6 +65,8 @@ type Config struct {
 	Model   string
 	System  string
 	Sandbox string
+	Serve   bool   // run the web chat server instead of the CLI
+	Addr    string // listen address for -serve mode
 }
 
 type Client struct {
@@ -85,6 +87,7 @@ func NewClient(host, model string) *Client {
 type Agent struct {
 	client  *Client
 	toolbox *Toolbox
+	system  string // kept so Reset can rebuild a fresh history
 	history []Message
 }
 
@@ -92,8 +95,15 @@ func NewAgent(client *Client, toolbox *Toolbox, system string) *Agent {
 	return &Agent{
 		client:  client,
 		toolbox: toolbox,
+		system:  system,
 		history: []Message{{Role: "system", Content: system}},
 	}
+}
+
+// Reset clears the conversation back to just the system prompt, starting a new
+// chat without rebuilding the Agent.
+func (a *Agent) Reset() {
+	a.history = []Message{{Role: "system", Content: a.system}}
 }
 
 func main() {
@@ -116,6 +126,8 @@ func parseConfig() Config {
 	flag.StringVar(&cfg.Model, "model", envOr("OLLAMA_MODEL", "llama3.2"), "model name")
 	flag.StringVar(&cfg.System, "system", defaultSystemPrompt, "system prompt")
 	flag.StringVar(&cfg.Sandbox, "sandbox", ".", "directory the read_file tool is restricted to")
+	flag.BoolVar(&cfg.Serve, "serve", false, "run the web chat server instead of the CLI")
+	flag.StringVar(&cfg.Addr, "addr", "localhost:8080", "listen address for -serve mode")
 	flag.Parse()
 	return cfg
 }
@@ -157,6 +169,67 @@ func (c *Client) Chat(ctx context.Context, messages []Message, tools []ToolSpec)
 	return result.Message, nil
 }
 
+// ChatStream is the streaming twin of Chat. With stream:true Ollama returns one
+// JSON object per line; we decode them one at a time, call onDelta for every
+// content fragment as it arrives, and reassemble the full reply (text joined,
+// tool calls collected) so the caller can append it to history exactly as the
+// non-streaming path does. Ollama sends a tool call whole in a single chunk, so
+// we never have to stitch partial tool-call JSON together.
+func (c *Client) ChatStream(ctx context.Context, messages []Message, tools []ToolSpec, onDelta func(string)) (Message, error) {
+	payload, err := json.Marshal(chatRequest{
+		Model:    c.model,
+		Messages: messages,
+		Stream:   true,
+		Tools:    tools,
+	})
+	if err != nil {
+		return Message{}, fmt.Errorf("encoding request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.host+"/api/chat", bytes.NewReader(payload))
+	if err != nil {
+		return Message{}, fmt.Errorf("building request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return Message{}, fmt.Errorf("calling ollama: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return Message{}, fmt.Errorf("ollama returned %s: %s", resp.Status, body)
+	}
+
+	var (
+		full  strings.Builder
+		calls []ToolCall
+	)
+	dec := json.NewDecoder(resp.Body)
+	for {
+		var chunk chatResponse
+		if err := dec.Decode(&chunk); err == io.EOF {
+			break
+		} else if err != nil {
+			return Message{}, fmt.Errorf("decoding stream: %w", err)
+		}
+		if chunk.Message.Content != "" {
+			full.WriteString(chunk.Message.Content)
+			onDelta(chunk.Message.Content)
+		}
+		if len(chunk.Message.ToolCalls) > 0 {
+			calls = append(calls, chunk.Message.ToolCalls...)
+		}
+		if chunk.Done {
+			break
+		}
+	}
+
+	return Message{Role: "assistant", Content: full.String(), ToolCalls: calls}, nil
+}
+
 // Ask runs one user turn through the agent loop: keep calling the model and
 // running any tools it requests until it returns a plain text answer.
 func (a *Agent) Ask(ctx context.Context, input string) (string, error) {
@@ -196,6 +269,53 @@ func (a *Agent) Ask(ctx context.Context, input string) (string, error) {
 	return "I got stuck trying to use my tools. Could you rephrase that?", nil
 }
 
+// AskStream is the streaming twin of Ask. It runs the same bounded tool loop but
+// pushes incremental Events to emit as they happen: token deltas while the model
+// speaks, a tool_call/tool_result pair around each tool, and a final done. emit
+// is called synchronously on this goroutine, so events arrive in causal order.
+func (a *Agent) AskStream(ctx context.Context, input string, emit func(Event)) error {
+	a.history = append(a.history, Message{Role: "user", Content: input})
+
+	for range maxToolIterations {
+		reply, err := a.client.ChatStream(ctx, a.history, a.toolbox.Specs(),
+			func(delta string) { emit(Event{Kind: EventToken, Text: delta}) })
+		if err != nil {
+			return err
+		}
+		a.history = append(a.history, reply)
+
+		if len(reply.ToolCalls) == 0 {
+			if looksLikeToolCallLeak(reply.Content) {
+				a.history = append(a.history, Message{
+					Role:    "user",
+					Content: "Please answer in plain text, or make a proper tool call.",
+				})
+				continue
+			}
+			emit(Event{Kind: EventDone})
+			return nil
+		}
+
+		// Run each requested tool, surfacing it as events, and feed results back in.
+		for _, call := range reply.ToolCalls {
+			args, _ := json.Marshal(call.Function.Arguments)
+			emit(Event{Kind: EventToolCall, Tool: call.Function.Name, Args: string(args)})
+			result := a.runToolCall(call)
+			emit(Event{Kind: EventToolResult, Tool: call.Function.Name, Result: result})
+			a.history = append(a.history, Message{
+				Role:     "tool",
+				Content:  result,
+				ToolName: call.Function.Name,
+			})
+		}
+	}
+
+	// Exhausted the tool budget. End the turn cleanly instead of hanging.
+	emit(Event{Kind: EventToken, Text: "I got stuck trying to use my tools. Could you rephrase that?"})
+	emit(Event{Kind: EventDone})
+	return nil
+}
+
 // runToolCall executes one tool call. Unknown tools and tool errors are turned
 // into messages the model can read and recover from — never a crash. The error
 // text lists the real tools so the model can correct itself.
@@ -230,6 +350,10 @@ func run() error {
 		readFileTool(cfg.Sandbox),
 	)
 	agent := NewAgent(client, toolbox, cfg.System)
+
+	if cfg.Serve {
+		return serveHTTP(agent, cfg.Addr)
+	}
 
 	fmt.Printf("Chat with %s (tools: %s). Type 'exit' or Ctrl-D to quit.\n",
 		cfg.Model, strings.Join(toolbox.Names(), ", "))

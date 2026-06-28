@@ -58,6 +58,29 @@ tool, the program ran it, and the result was fed back for the final answer.
 | `-host` | `http://localhost:11434` (env `OLLAMA_HOST`) | Ollama server URL. |
 | `-system` | built-in prompt | Override the system prompt. |
 | `-sandbox` | `.` | Directory the `read_file` tool is restricted to. |
+| `-serve` | `false` | Run the web chat UI instead of the CLI. |
+| `-addr` | `localhost:8080` | Listen address for `-serve` mode. |
+
+## Web UI
+
+The same agent, in the browser, with answers that **stream token-by-token**:
+
+```sh
+go run . -serve -model qwen2.5
+# then open http://localhost:8080
+```
+
+The UI is a single `web/index.html` **embedded into the binary** (`//go:embed`),
+served by Go's standard library — no JS framework, no build step. The browser
+POSTs your message and reads back a stream of newline-delimited JSON events
+(`token`, `tool_call`, `tool_result`, `done`), rendering text as it arrives and
+showing tool activity inline. "New chat" clears the conversation.
+
+The server binds to **`localhost` only** by default: the `read_file` tool runs
+on behalf of anyone who can reach the port, so it is not exposed on the network.
+
+It is the *same* `Agent` and tools as the CLI — only the front-end differs. See
+`Client.ChatStream` and `Agent.AskStream` in `main.go`, and `server.go`.
 
 ## How it works — the agent loop
 
@@ -78,9 +101,11 @@ That loop *is* the agent. Frameworks dress it up; this is the core.
 ## Project structure
 
 ```
-main.go        Client (HTTP to Ollama), Agent (the loop), CLI, config
-tools.go       Tool/Toolbox types and the three tool implementations
-tools_test.go  Unit tests (calculator + the read_file sandbox guard)
+main.go         Client (HTTP to Ollama), Agent (the loop), CLI, config
+server.go       Web mode: streaming HTTP handlers + embedded UI
+web/index.html  Single-file browser chat (vanilla HTML/CSS/JS)
+tools.go        Tool/Toolbox types and the three tool implementations
+tools_test.go   Unit tests (calculator + the read_file sandbox guard)
 ```
 
 ## Testing
