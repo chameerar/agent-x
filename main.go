@@ -12,6 +12,9 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 const defaultSystemPrompt = "You are Agent X, a concise and friendly assistant. " +
@@ -67,6 +70,9 @@ type Config struct {
 	Sandbox string
 	Serve   bool   // run the web chat server instead of the CLI
 	Addr    string // listen address for -serve mode
+
+	OTel         bool   // export traces to an OTLP collector (Jaeger)
+	OTelEndpoint string // OTLP/HTTP endpoint, host:port
 }
 
 type Client struct {
@@ -128,13 +134,25 @@ func parseConfig() Config {
 	flag.StringVar(&cfg.Sandbox, "sandbox", ".", "directory the read_file tool is restricted to")
 	flag.BoolVar(&cfg.Serve, "serve", false, "run the web chat server instead of the CLI")
 	flag.StringVar(&cfg.Addr, "addr", "localhost:8080", "listen address for -serve mode")
+	flag.BoolVar(&cfg.OTel, "otel", false, "export traces to an OTLP collector (Jaeger)")
+	flag.StringVar(&cfg.OTelEndpoint, "otel-endpoint", "localhost:4318", "OTLP/HTTP endpoint (host:port)")
 	flag.Parse()
 	return cfg
 }
 
 // Chat sends the conversation plus available tools and returns the model's
 // reply, which may be plain text or a request to call tools.
-func (c *Client) Chat(ctx context.Context, messages []Message, tools []ToolSpec) (Message, error) {
+func (c *Client) Chat(ctx context.Context, messages []Message, tools []ToolSpec) (msg Message, err error) {
+	ctx, span := tracer.Start(ctx, "llm.chat")
+	span.SetAttributes(attribute.String("llm.model", c.model))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	payload, err := json.Marshal(chatRequest{
 		Model:    c.model,
 		Messages: messages,
@@ -175,7 +193,20 @@ func (c *Client) Chat(ctx context.Context, messages []Message, tools []ToolSpec)
 // tool calls collected) so the caller can append it to history exactly as the
 // non-streaming path does. Ollama sends a tool call whole in a single chunk, so
 // we never have to stitch partial tool-call JSON together.
-func (c *Client) ChatStream(ctx context.Context, messages []Message, tools []ToolSpec, onDelta func(string)) (Message, error) {
+func (c *Client) ChatStream(ctx context.Context, messages []Message, tools []ToolSpec, onDelta func(string)) (msg Message, err error) {
+	ctx, span := tracer.Start(ctx, "llm.chat")
+	span.SetAttributes(
+		attribute.String("llm.model", c.model),
+		attribute.Bool("llm.stream", true),
+	)
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	payload, err := json.Marshal(chatRequest{
 		Model:    c.model,
 		Messages: messages,
@@ -233,6 +264,9 @@ func (c *Client) ChatStream(ctx context.Context, messages []Message, tools []Too
 // Ask runs one user turn through the agent loop: keep calling the model and
 // running any tools it requests until it returns a plain text answer.
 func (a *Agent) Ask(ctx context.Context, input string) (string, error) {
+	ctx, span := tracer.Start(ctx, "agent.turn")
+	defer span.End()
+
 	a.history = append(a.history, Message{Role: "user", Content: input})
 
 	for range maxToolIterations {
@@ -255,7 +289,7 @@ func (a *Agent) Ask(ctx context.Context, input string) (string, error) {
 
 		// Run each requested tool and feed the results back in.
 		for _, call := range reply.ToolCalls {
-			result := a.runToolCall(call)
+			result := a.runToolCall(ctx, call)
 			fmt.Printf("  [tool] %s(%v) => %s\n", call.Function.Name, call.Function.Arguments, result)
 			a.history = append(a.history, Message{
 				Role:     "tool",
@@ -274,6 +308,9 @@ func (a *Agent) Ask(ctx context.Context, input string) (string, error) {
 // speaks, a tool_call/tool_result pair around each tool, and a final done. emit
 // is called synchronously on this goroutine, so events arrive in causal order.
 func (a *Agent) AskStream(ctx context.Context, input string, emit func(Event)) error {
+	ctx, span := tracer.Start(ctx, "agent.turn")
+	defer span.End()
+
 	a.history = append(a.history, Message{Role: "user", Content: input})
 
 	for range maxToolIterations {
@@ -300,7 +337,7 @@ func (a *Agent) AskStream(ctx context.Context, input string, emit func(Event)) e
 		for _, call := range reply.ToolCalls {
 			args, _ := json.Marshal(call.Function.Arguments)
 			emit(Event{Kind: EventToolCall, Tool: call.Function.Name, Args: string(args)})
-			result := a.runToolCall(call)
+			result := a.runToolCall(ctx, call)
 			emit(Event{Kind: EventToolResult, Tool: call.Function.Name, Result: result})
 			a.history = append(a.history, Message{
 				Role:     "tool",
@@ -319,12 +356,35 @@ func (a *Agent) AskStream(ctx context.Context, input string, emit func(Event)) e
 // runToolCall executes one tool call. Unknown tools and tool errors are turned
 // into messages the model can read and recover from — never a crash. The error
 // text lists the real tools so the model can correct itself.
-func (a *Agent) runToolCall(call ToolCall) string {
+func (a *Agent) runToolCall(ctx context.Context, call ToolCall) string {
+	_, span := tracer.Start(ctx, "tool."+call.Function.Name)
+	defer span.End()
+	args, _ := json.Marshal(call.Function.Arguments)
+	span.SetAttributes(
+		attribute.String("tool.name", call.Function.Name),
+		attribute.String("tool.args", string(args)),
+	)
+
 	result, err := a.toolbox.Run(call.Function.Name, call.Function.Arguments)
 	if err != nil {
-		return fmt.Sprintf("error: %v (available tools: %s)", err, strings.Join(a.toolbox.Names(), ", "))
+		msg := fmt.Sprintf("error: %v (available tools: %s)", err, strings.Join(a.toolbox.Names(), ", "))
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		span.SetAttributes(attribute.String("tool.result", msg))
+		return msg
 	}
+	// Truncate: results can be large (read_file) or sensitive, and the tracing
+	// backend retains whatever we send. A preview is enough to follow the loop.
+	span.SetAttributes(attribute.String("tool.result", truncate(result, 256)))
 	return result
+}
+
+func truncate(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "…"
 }
 
 func looksLikeToolCallLeak(content string) bool {
@@ -343,6 +403,20 @@ func looksLikeToolCallLeak(content string) bool {
 
 func run() error {
 	cfg := parseConfig()
+
+	if cfg.OTel {
+		shutdown, err := initTracing(context.Background(), cfg)
+		if err != nil {
+			return fmt.Errorf("init tracing: %w", err)
+		}
+		// Flush batched spans before exit, or the final trace is lost.
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = shutdown(ctx)
+		}()
+	}
+
 	client := NewClient(cfg.Host, cfg.Model)
 	toolbox := NewToolbox(
 		calculatorTool(),
