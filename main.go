@@ -30,7 +30,6 @@ const defaultSystemPrompt = "You are Agent X, a concise and friendly assistant. 
 	"call it in the same turn. Never end your reply by promising to do something " +
 	"next; either call the tool now or give the final answer.\n" +
 	"- Do not call a tool just to demonstrate it, and do not invent file paths.\n" +
-	"- If asked what tools you have, describe them in words instead of calling them.\n" +
 	"Keep answers short."
 
 // maxToolIterations caps tool round-trips per turn so a confused model can't loop forever.
@@ -137,8 +136,8 @@ func parseConfig() Config {
 	flag.StringVar(&cfg.Sandbox, "sandbox", ".", "directory the read_file tool is restricted to")
 	flag.BoolVar(&cfg.Serve, "serve", false, "run the web chat server instead of the CLI")
 	flag.StringVar(&cfg.Addr, "addr", "localhost:8080", "listen address for -serve mode")
-	flag.BoolVar(&cfg.OTel, "otel", false, "export traces to an OTLP collector (Jaeger)")
-	flag.StringVar(&cfg.OTelEndpoint, "otel-endpoint", "localhost:4318", "OTLP/HTTP endpoint (host:port)")
+	flag.BoolVar(&cfg.OTel, "otel", os.Getenv("OTEL") == "true", "export traces to an OTLP collector (Jaeger)")
+	flag.StringVar(&cfg.OTelEndpoint, "otel-endpoint", envOr("OTEL_ENDPOINT", "localhost:4318"), "OTLP/HTTP endpoint (host:port)")
 	flag.Parse()
 	return cfg
 }

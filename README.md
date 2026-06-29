@@ -1,111 +1,88 @@
 # Agent X — a tiny AI agent in Go, from scratch
 
-A learning project: a command-line AI agent built **from scratch in Go**, talking
-to a **local LLM via [Ollama](https://ollama.com)** — no agent framework, just
-`net/http`, `encoding/json`, and the agent loop written by hand.
+A command-line **and** web AI agent built from scratch in Go against a local LLM
+via [Ollama](https://ollama.com) — no agent framework, just `net/http`,
+`encoding/json`, and the agent loop written by hand. Instrumented with
+**OpenTelemetry**, so every turn is a trace you can watch.
 
-The goal is to *understand* what an agent really is. Spoiler: it's a loop, some
-HTTP calls, and a list of tools. Everything else is polish.
+The point is to show what an agent *actually* is: a bounded loop, some HTTP
+calls, and a list of tools. Everything else is polish.
 
-## What it does
+## The agent loop
 
-- Multi-turn **chat** with conversation memory.
-- **Tool calling**: the model can ask the program to run tools, and the program
-  feeds results back until the model produces a final answer (the agent loop).
-- Three built-in tools:
-  | Tool | Description |
-  |------|-------------|
-  | `calculator` | Basic arithmetic (`add`, `subtract`, `multiply`, `divide`). |
-  | `current_time` | The current local date and time. |
-  | `read_file` | Reads a text file **sandboxed** to one directory. |
-- Defensive by design: unknown-tool guard, malformed-output guard, bounded tool
-  iterations, graceful per-turn error recovery, and a path-traversal-proof
-  file sandbox.
+The whole thing is `Agent.Ask`:
 
-## Prerequisites
+```
+loop (bounded):
+  reply = model(history + tool definitions)
+  if reply has no tool calls:  return reply text     // done
+  for each tool call:
+      result = run the tool
+      append result to history                       // feed it back
+  // loop again so the model sees the result
+```
 
-- **Go 1.26+** (the module pins `toolchain go1.26.4`).
-- **[Ollama](https://ollama.com)** running locally.
-- A **tool-capable** model. `qwen2.5` is recommended; `llama3.2` works but is
-  unreliable at deciding when to call tools.
+That loop *is* the agent. A `maxToolIterations` cap keeps a confused model from
+spinning forever.
+
+## Tools
+
+| Tool | Description |
+|------|-------------|
+| `calculator` | Arithmetic (`add`, `subtract`, `multiply`, `divide`). |
+| `current_time` | Current local date and time. |
+| `read_file` | Reads a text file **sandboxed** to one directory. |
+
+Defensive by design: unknown-tool guard, malformed-output guard, bounded
+iterations, and per-turn errors handed back to the model as text it can recover
+from. Security rules live in **code, never the prompt** — a model can ignore a
+prompt, but it can't bypass a path-traversal check in Go.
+
+## Run it
+
+Needs [Ollama](https://ollama.com) and a tool-capable model (`ollama pull qwen2.5`).
 
 ```sh
-ollama pull qwen2.5
+go run . -model qwen2.5            # CLI chat
+go run . -serve -model qwen2.5     # web UI at http://localhost:8080
 ```
 
-## Quick start
+`go run . -h` lists all flags (`-host`, `-system`, `-sandbox`, `-addr`, …).
+
+### With Docker (no Go toolchain)
 
 ```sh
-go run . -model qwen2.5
+cp .env.example .env
+docker compose up --build                      # talks to an Ollama you already run
+docker compose --profile bundled up --build    # or run Ollama in Docker too
 ```
 
-```
-Chat with qwen2.5 (tools: calculator, current_time, read_file). Type 'exit' or Ctrl-D to quit.
-
-You: what is 4839 multiplied by 1271?
-  [tool] calculator(map[a:4839 b:1271 operation:multiply]) => 6150369
-AI:  4839 multiplied by 1271 is 6150369.
-```
-
-The `[tool] ...` lines show the agent loop in action: the model requested a
-tool, the program ran it, and the result was fed back for the final answer.
-
-## Usage
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-model` | `llama3.2` (env `OLLAMA_MODEL`) | Ollama model to use. |
-| `-host` | `http://localhost:11434` (env `OLLAMA_HOST`) | Ollama server URL. |
-| `-system` | built-in prompt | Override the system prompt. |
-| `-sandbox` | `.` | Directory the `read_file` tool is restricted to. |
-| `-serve` | `false` | Run the web chat UI instead of the CLI. |
-| `-addr` | `localhost:8080` | Listen address for `-serve` mode. |
-| `-otel` | `false` | Export traces to an OTLP collector (e.g. Jaeger). |
-| `-otel-endpoint` | `localhost:4318` | OTLP/HTTP endpoint (host:port). |
+`.env` sets the model, port, and where to find Ollama. **Bundled** mode pulls the
+model on first start and runs Ollama CPU-only (slower — comment out `OLLAMA_HOST`
+first). The web UI binds `127.0.0.1` only, since `read_file` acts for anyone who
+can reach the port. Stop with `docker compose down` (`-v` also drops the model
+volume).
 
 ## Web UI
 
-The same agent, in the browser, with answers that **stream token-by-token**:
+The same `Agent` and tools, streaming **token-by-token** in the browser.
+`web/index.html` is a single file **embedded into the binary** (`//go:embed`) and
+served by the standard library — no JS framework, no build step. The browser
+POSTs a message and reads back newline-delimited JSON events (`token`,
+`tool_call`, `tool_result`, `done`), rendering text as it arrives. See
+`Agent.AskStream` and `server.go`.
+
+## Tracing with OpenTelemetry
+
+The agent loop maps cleanly onto distributed tracing: a **turn is a trace**, and
+each model round-trip and tool call is a nested **span**.
 
 ```sh
-go run . -serve -model qwen2.5
-# then open http://localhost:8080
+OTEL=true docker compose --profile tracing up --build   # agent + Jaeger
+# or locally: run Jaeger, then `go run . -model qwen2.5 -otel`
 ```
 
-The UI is a single `web/index.html` **embedded into the binary** (`//go:embed`),
-served by Go's standard library — no JS framework, no build step. The browser
-POSTs your message and reads back a stream of newline-delimited JSON events
-(`token`, `tool_call`, `tool_result`, `done`), rendering text as it arrives and
-showing tool activity inline. "New chat" clears the conversation.
-
-The server binds to **`localhost` only** by default: the `read_file` tool runs
-on behalf of anyone who can reach the port, so it is not exposed on the network.
-
-It is the *same* `Agent` and tools as the CLI — only the front-end differs. See
-`Client.ChatStream` and `Agent.AskStream` in `main.go`, and `server.go`.
-
-## Tracing — watch the loop with OpenTelemetry
-
-The agent loop maps naturally onto **distributed tracing**: a *turn* is a trace,
-and every model round-trip and tool call is a nested *span*. With `-otel` on,
-Agent X exports those spans over OTLP/HTTP so you can watch the loop as a
-waterfall in [Jaeger](https://www.jaegertracing.io/).
-
-Run Jaeger (its UI is on `16686`, its OTLP/HTTP receiver on `4318`):
-
-```sh
-docker run -d --name jaeger -e COLLECTOR_OTLP_ENABLED=true \
-  -p 16686:16686 -p 4317:4317 -p 4318:4318 \
-  jaegertracing/all-in-one:latest
-```
-
-Then run with tracing on (works in both CLI and `-serve` mode):
-
-```sh
-go run . -model qwen2.5 -otel
-```
-
-Open <http://localhost:16686>, pick the **agent-x** service, and a turn looks like:
+Open <http://localhost:16686>, pick the **agent-x** service, and a turn reads:
 
 ```
 agent.turn
@@ -114,71 +91,49 @@ agent.turn
  └─ llm.chat          (the final, streamed answer)
 ```
 
-How it is wired (all opt-in, see `tracing.go`):
+How it's wired (`tracing.go`):
 
-- A `TracerProvider` exports spans to the OTLP endpoint; `initTracing` returns a
-  shutdown func that **flushes** batched spans on exit (or the last trace is lost).
-- Spans nest via `context.Context` — the same `ctx` already threaded through the
-  loop carries the parent span, so children attach automatically.
-- LLM spans use OpenTelemetry's **GenAI semantic conventions** (`gen_ai.*`),
-  including real prompt/response **token counts** read from Ollama's response.
-- Tool results are **truncated** before being recorded — telemetry backends
-  retain what you send, so we never dump whole files or sensitive content.
+- A `TracerProvider` exports over OTLP/HTTP; `initTracing` returns a shutdown func
+  that **flushes** batched spans on exit (or the last trace is lost).
+- Spans nest via `context.Context` — the same `ctx` threaded through the loop
+  carries the parent span, so children attach automatically.
+- LLM spans follow the **GenAI semantic conventions** (`gen_ai.*`), with real
+  prompt/response **token counts** read from Ollama's response.
+- Tool results are **truncated** before recording — backends keep what you send,
+  so no whole files or secrets land in telemetry.
 
-When `-otel` is off there is no provider, so every span is a no-op and free.
+Off by default: with no provider installed, every span is a no-op and free.
 
-## How it works — the agent loop
+## What controls an agent's behavior
 
-The heart of `Agent.Ask`:
+Three independent levers — worth separating, because they fail differently:
 
-```
-loop (bounded):
-  reply = model(history + tool definitions)
-  if reply has no tool calls:  return reply text   // done
-  for each tool call:
-      result = run the tool
-      append result to history                      // feed it back
-  // loop again so the model sees the result
-```
+| Lever | Controls | Example |
+|-------|----------|---------|
+| **Model choice** | Whether/which tool to call | `qwen2.5` decides well; small 3B models guess |
+| **System prompt** | The policy for when tools apply | "never guess a value a tool can give you" |
+| **Defensive code** | What happens when the model misbehaves | sandbox guard, error feedback, iteration cap |
 
-That loop *is* the agent. Frameworks dress it up; this is the core.
+Autonomous multi-step chaining (read → compute → answer) improves sharply with
+larger models; 3B models often emit malformed tool args or skip the tool — both
+visible in the traces above.
 
-## Project structure
+## Layout
 
 ```
 main.go         Client (HTTP to Ollama), Agent (the loop), CLI, config
 server.go       Web mode: streaming HTTP handlers + embedded UI
 web/index.html  Single-file browser chat (vanilla HTML/CSS/JS)
-tracing.go      OpenTelemetry setup (opt-in -otel): exporter, provider, flush
-tools.go        Tool/Toolbox types and the three tool implementations
-tools_test.go   Unit tests (calculator + the read_file sandbox guard)
+tracing.go      OpenTelemetry setup (opt-in): exporter, provider, flush
+tools.go        Tool/Toolbox types and the three tools
+tools_test.go   Calculator + read_file sandbox tests
+Dockerfile      Multi-stage build → tiny static (distroless) image
+compose.yaml    Agent; Ollama and Jaeger behind --profile bundled/tracing
 ```
-
-## Testing
 
 ```sh
-go test ./...
+go test ./...   # calculator behavior + read_file sandbox escapes
 ```
-
-The tests assert calculator behavior (including string-coerced operands and
-divide-by-zero) and prove the `read_file` sandbox blocks path traversal and
-absolute-path escapes.
-
-## Notes on model behavior
-
-Three independent levers control how an agent behaves:
-
-| Lever | Controls | Example |
-|-------|----------|---------|
-| **Model choice** | Whether/which tool to call | `qwen2.5` decides well; `llama3.2` over-calls |
-| **System prompt** | The policy for when tools apply | "never guess a value a tool can give you" |
-| **Defensive code** | What happens when the model misbehaves | sandbox guard, error feedback, iteration cap |
-
-Security rules (like the file sandbox) live in **code**, never in the prompt —
-a model can ignore a prompt, but it cannot bypass a path check in Go.
-
-Multi-step *autonomous* tool chaining (read → fetch → calculate without a nudge)
-improves sharply with larger models; small 3B models often guess instead.
 
 ---
 

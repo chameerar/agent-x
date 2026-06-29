@@ -5,3 +5,6 @@
 *.exe
 *.test
 *.out
+
+# Local docker compose config (commit .env.example instead)
+.env

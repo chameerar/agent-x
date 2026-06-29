@@ -1,0 +1,14 @@
+# Keep the build context small and reproducible. Note: test.txt is intentionally
+# NOT ignored — the Dockerfile copies it in as the read_file demo file.
+.git
+.gitignore
+.dockerignore
+.claude
+PLAN.md
+README.md
+
+# Local build artifacts (the binary is rebuilt inside the image)
+/agent-x
+*.exe
+*.test
+*.out

@@ -1,0 +1,69 @@
+name: agent-x
+
+services:
+  # Bundled LLM, opt-in via `--profile bundled`. Leave the profile off to use an
+  # Ollama you already run. Models live in a named volume so they download once.
+  ollama:
+    profiles: ["bundled"]
+    image: ollama/ollama:latest
+    volumes:
+      - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  # One-shot job: pull the model into ollama's volume, then exit. agent-x waits
+  # for this to finish, so the first chat never races an unavailable model.
+  # The pull runs server-side over OLLAMA_HOST, so this needs no volume of its own.
+  model-pull:
+    profiles: ["bundled"]
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["ollama", "pull", "${MODEL:-qwen2.5:3b}"]
+    restart: "no"
+
+  # Trace viewer, opt-in via `--profile tracing`. Set OTEL=true (e.g. in .env) to
+  # make the agent export to it. UI on 16686; OTLP receiver (4318) stays internal.
+  jaeger:
+    profiles: ["tracing"]
+    image: jaegertracing/all-in-one:latest
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "127.0.0.1:16686:16686"
+    restart: unless-stopped
+
+  agent-x:
+    build: .
+    # required:false lets agent-x start without these when their profiles are off
+    # (bring-your-own Ollama, or tracing disabled).
+    depends_on:
+      model-pull:
+        condition: service_completed_successfully
+        required: false
+      jaeger:
+        condition: service_started
+        required: false
+    environment:
+      # Bundled run resolves "ollama" on the compose network. Bringing your own?
+      # Set OLLAMA_HOST=http://host.docker.internal:11434 in .env.
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://ollama:11434}
+      OLLAMA_MODEL: ${MODEL:-qwen2.5:3b}
+      # OTEL=true turns on tracing; the agent then exports to the jaeger service.
+      OTEL: ${OTEL:-}
+      OTEL_ENDPOINT: ${OTEL_ENDPOINT:-jaeger:4318}
+    ports:
+      - "127.0.0.1:${PORT:-8080}:8080"
+    volumes:
+      - ./test.txt:/sandbox/test.txt:ro
+    restart: unless-stopped
+
+volumes:
+  ollama-models:
