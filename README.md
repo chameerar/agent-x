@@ -60,6 +60,8 @@ tool, the program ran it, and the result was fed back for the final answer.
 | `-sandbox` | `.` | Directory the `read_file` tool is restricted to. |
 | `-serve` | `false` | Run the web chat UI instead of the CLI. |
 | `-addr` | `localhost:8080` | Listen address for `-serve` mode. |
+| `-otel` | `false` | Export traces to an OTLP collector (e.g. Jaeger). |
+| `-otel-endpoint` | `localhost:4318` | OTLP/HTTP endpoint (host:port). |
 
 ## Web UI
 
@@ -81,6 +83,49 @@ on behalf of anyone who can reach the port, so it is not exposed on the network.
 
 It is the *same* `Agent` and tools as the CLI — only the front-end differs. See
 `Client.ChatStream` and `Agent.AskStream` in `main.go`, and `server.go`.
+
+## Tracing — watch the loop with OpenTelemetry
+
+The agent loop maps naturally onto **distributed tracing**: a *turn* is a trace,
+and every model round-trip and tool call is a nested *span*. With `-otel` on,
+Agent X exports those spans over OTLP/HTTP so you can watch the loop as a
+waterfall in [Jaeger](https://www.jaegertracing.io/).
+
+Run Jaeger (its UI is on `16686`, its OTLP/HTTP receiver on `4318`):
+
+```sh
+docker run -d --name jaeger -e COLLECTOR_OTLP_ENABLED=true \
+  -p 16686:16686 -p 4317:4317 -p 4318:4318 \
+  jaegertracing/all-in-one:latest
+```
+
+Then run with tracing on (works in both CLI and `-serve` mode):
+
+```sh
+go run . -model qwen2.5 -otel
+```
+
+Open <http://localhost:16686>, pick the **agent-x** service, and a turn looks like:
+
+```
+agent.turn
+ ├─ llm.chat          gen_ai.request.model, gen_ai.usage.input/output_tokens
+ ├─ tool.calculator   tool.args={...}, tool.result=...
+ └─ llm.chat          (the final, streamed answer)
+```
+
+How it is wired (all opt-in, see `tracing.go`):
+
+- A `TracerProvider` exports spans to the OTLP endpoint; `initTracing` returns a
+  shutdown func that **flushes** batched spans on exit (or the last trace is lost).
+- Spans nest via `context.Context` — the same `ctx` already threaded through the
+  loop carries the parent span, so children attach automatically.
+- LLM spans use OpenTelemetry's **GenAI semantic conventions** (`gen_ai.*`),
+  including real prompt/response **token counts** read from Ollama's response.
+- Tool results are **truncated** before being recorded — telemetry backends
+  retain what you send, so we never dump whole files or sensitive content.
+
+When `-otel` is off there is no provider, so every span is a no-op and free.
 
 ## How it works — the agent loop
 
@@ -104,6 +149,7 @@ That loop *is* the agent. Frameworks dress it up; this is the core.
 main.go         Client (HTTP to Ollama), Agent (the loop), CLI, config
 server.go       Web mode: streaming HTTP handlers + embedded UI
 web/index.html  Single-file browser chat (vanilla HTML/CSS/JS)
+tracing.go      OpenTelemetry setup (opt-in -otel): exporter, provider, flush
 tools.go        Tool/Toolbox types and the three tool implementations
 tools_test.go   Unit tests (calculator + the read_file sandbox guard)
 ```

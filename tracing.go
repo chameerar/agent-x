@@ -11,20 +11,15 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
 )
 
-// tracer is the handle we Start spans from. otel.Tracer returns a delegating
-// tracer: until a real TracerProvider is installed it is a no-op, so every
-// span in the codebase is free when -otel is off. initTracing swaps in the
-// real provider at startup.
+// tracer Starts every span. otel.Tracer returns a delegating tracer that is a
+// no-op until a real provider is installed, so spans are free when -otel is off.
 var tracer = otel.Tracer("agent-x")
 
-// initTracing builds a TracerProvider that exports spans over OTLP/HTTP to a
-// collector (Jaeger) and registers it globally. It returns a shutdown func
-// that flushes buffered spans — spans are batched, so without this final
-// flush the last trace is lost on exit.
+// initTracing registers a global TracerProvider that exports spans over OTLP/HTTP
+// to a collector (Jaeger). The returned shutdown func flushes batched spans on
+// exit — without it the last trace is lost.
 func initTracing(ctx context.Context, cfg Config) (func(context.Context) error, error) {
-	// Exporter: encodes finished spans as OTLP and POSTs them to the collector.
-	// WithEndpoint takes host:port (no scheme); WithInsecure means plain HTTP,
-	// which is correct for a local Jaeger.
+	// WithEndpoint takes host:port (no scheme); WithInsecure means plain HTTP.
 	exporter, err := otlptracehttp.New(ctx,
 		otlptracehttp.WithEndpoint(cfg.OTelEndpoint),
 		otlptracehttp.WithInsecure(),
@@ -33,8 +28,7 @@ func initTracing(ctx context.Context, cfg Config) (func(context.Context) error, 
 		return nil, fmt.Errorf("creating otlp exporter: %w", err)
 	}
 
-	// Resource: identity attached to every span, so Jaeger files all our traces
-	// under the "agent-x" service.
+	// Resource identifies us on every span, so Jaeger groups traces under "agent-x".
 	res, err := resource.Merge(resource.Default(), resource.NewWithAttributes(
 		semconv.SchemaURL,
 		semconv.ServiceName("agent-x"),
@@ -43,7 +37,6 @@ func initTracing(ctx context.Context, cfg Config) (func(context.Context) error, 
 		return nil, fmt.Errorf("building resource: %w", err)
 	}
 
-	// Provider: owns the exporter + resource, batches spans in the background.
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(res),

@@ -26,12 +26,14 @@ const defaultSystemPrompt = "You are Agent X, a concise and friendly assistant. 
 	"contents — even if you think you know the answer.\n" +
 	"- If a task needs several steps (e.g. read a file, then get the time, then " +
 	"calculate), call the tools one at a time, using each result, before you answer.\n" +
+	"- ACT, do not announce. Never say you are 'about to' or 'will' call a tool — " +
+	"call it in the same turn. Never end your reply by promising to do something " +
+	"next; either call the tool now or give the final answer.\n" +
 	"- Do not call a tool just to demonstrate it, and do not invent file paths.\n" +
 	"- If asked what tools you have, describe them in words instead of calling them.\n" +
 	"Keep answers short."
 
-// maxToolIterations caps how many tool round-trips one user turn may trigger,
-// so a confused model can't loop forever.
+// maxToolIterations caps tool round-trips per turn so a confused model can't loop forever.
 const maxToolIterations = 5
 
 type Message struct {
@@ -41,7 +43,6 @@ type Message struct {
 	ToolName  string     `json:"tool_name,omitempty"` // set on role:"tool" replies
 }
 
-// ToolCall is the model asking us to run a tool.
 type ToolCall struct {
 	Function ToolCallFunction `json:"function"`
 }
@@ -61,6 +62,11 @@ type chatRequest struct {
 type chatResponse struct {
 	Message Message `json:"message"`
 	Done    bool    `json:"done"`
+
+	// Ollama reports token usage on the final object (the one with done:true):
+	// prompt tokens in, generated tokens out.
+	PromptEvalCount int `json:"prompt_eval_count"`
+	EvalCount       int `json:"eval_count"`
 }
 
 type Config struct {
@@ -89,7 +95,6 @@ func NewClient(host, model string) *Client {
 	}
 }
 
-// Agent owns a conversation, a client, and a set of tools.
 type Agent struct {
 	client  *Client
 	toolbox *Toolbox
@@ -106,8 +111,6 @@ func NewAgent(client *Client, toolbox *Toolbox, system string) *Agent {
 	}
 }
 
-// Reset clears the conversation back to just the system prompt, starting a new
-// chat without rebuilding the Agent.
 func (a *Agent) Reset() {
 	a.history = []Message{{Role: "system", Content: a.system}}
 }
@@ -140,11 +143,14 @@ func parseConfig() Config {
 	return cfg
 }
 
-// Chat sends the conversation plus available tools and returns the model's
-// reply, which may be plain text or a request to call tools.
+// Chat returns the model's reply, which may be plain text or a request to call tools.
 func (c *Client) Chat(ctx context.Context, messages []Message, tools []ToolSpec) (msg Message, err error) {
 	ctx, span := tracer.Start(ctx, "llm.chat")
-	span.SetAttributes(attribute.String("llm.model", c.model))
+	span.SetAttributes(
+		// gen_ai.* are OpenTelemetry's standard attribute names for LLM calls.
+		attribute.String("gen_ai.system", "ollama"),
+		attribute.String("gen_ai.request.model", c.model),
+	)
 	defer func() {
 		if err != nil {
 			span.RecordError(err)
@@ -184,20 +190,22 @@ func (c *Client) Chat(ctx context.Context, messages []Message, tools []ToolSpec)
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return Message{}, fmt.Errorf("decoding response: %w", err)
 	}
+	span.SetAttributes(
+		attribute.Int("gen_ai.usage.input_tokens", result.PromptEvalCount),
+		attribute.Int("gen_ai.usage.output_tokens", result.EvalCount),
+	)
 	return result.Message, nil
 }
 
-// ChatStream is the streaming twin of Chat. With stream:true Ollama returns one
-// JSON object per line; we decode them one at a time, call onDelta for every
-// content fragment as it arrives, and reassemble the full reply (text joined,
-// tool calls collected) so the caller can append it to history exactly as the
-// non-streaming path does. Ollama sends a tool call whole in a single chunk, so
-// we never have to stitch partial tool-call JSON together.
+// ChatStream is the streaming twin of Chat: it calls onDelta for each content
+// fragment as it arrives, then returns the reassembled reply so the caller can
+// append it to history like the non-streaming path. Ollama sends each tool call
+// whole in one chunk, so we never stitch partial tool-call JSON together.
 func (c *Client) ChatStream(ctx context.Context, messages []Message, tools []ToolSpec, onDelta func(string)) (msg Message, err error) {
 	ctx, span := tracer.Start(ctx, "llm.chat")
 	span.SetAttributes(
-		attribute.String("llm.model", c.model),
-		attribute.Bool("llm.stream", true),
+		attribute.String("gen_ai.system", "ollama"),
+		attribute.String("gen_ai.request.model", c.model),
 	)
 	defer func() {
 		if err != nil {
@@ -254,6 +262,10 @@ func (c *Client) ChatStream(ctx context.Context, messages []Message, tools []Too
 			calls = append(calls, chunk.Message.ToolCalls...)
 		}
 		if chunk.Done {
+			span.SetAttributes(
+				attribute.Int("gen_ai.usage.input_tokens", chunk.PromptEvalCount),
+				attribute.Int("gen_ai.usage.output_tokens", chunk.EvalCount),
+			)
 			break
 		}
 	}
@@ -261,8 +273,8 @@ func (c *Client) ChatStream(ctx context.Context, messages []Message, tools []Too
 	return Message{Role: "assistant", Content: full.String(), ToolCalls: calls}, nil
 }
 
-// Ask runs one user turn through the agent loop: keep calling the model and
-// running any tools it requests until it returns a plain text answer.
+// Ask runs one user turn through the agent loop: call the model, run any tools
+// it requests, and repeat until it returns a plain-text answer.
 func (a *Agent) Ask(ctx context.Context, input string) (string, error) {
 	ctx, span := tracer.Start(ctx, "agent.turn")
 	defer span.End()
@@ -287,7 +299,6 @@ func (a *Agent) Ask(ctx context.Context, input string) (string, error) {
 			return reply.Content, nil
 		}
 
-		// Run each requested tool and feed the results back in.
 		for _, call := range reply.ToolCalls {
 			result := a.runToolCall(ctx, call)
 			fmt.Printf("  [tool] %s(%v) => %s\n", call.Function.Name, call.Function.Arguments, result)
@@ -299,14 +310,12 @@ func (a *Agent) Ask(ctx context.Context, input string) (string, error) {
 		}
 	}
 
-	// Exhausted the tool budget. Don't crash the session — return gracefully.
+	// Exhausted the tool budget — return gracefully instead of crashing the session.
 	return "I got stuck trying to use my tools. Could you rephrase that?", nil
 }
 
-// AskStream is the streaming twin of Ask. It runs the same bounded tool loop but
-// pushes incremental Events to emit as they happen: token deltas while the model
-// speaks, a tool_call/tool_result pair around each tool, and a final done. emit
-// is called synchronously on this goroutine, so events arrive in causal order.
+// AskStream is the streaming twin of Ask, pushing Events to emit as they happen.
+// emit is called synchronously on this goroutine, so events arrive in causal order.
 func (a *Agent) AskStream(ctx context.Context, input string, emit func(Event)) error {
 	ctx, span := tracer.Start(ctx, "agent.turn")
 	defer span.End()
@@ -333,7 +342,6 @@ func (a *Agent) AskStream(ctx context.Context, input string, emit func(Event)) e
 			return nil
 		}
 
-		// Run each requested tool, surfacing it as events, and feed results back in.
 		for _, call := range reply.ToolCalls {
 			args, _ := json.Marshal(call.Function.Arguments)
 			emit(Event{Kind: EventToolCall, Tool: call.Function.Name, Args: string(args)})
@@ -347,15 +355,14 @@ func (a *Agent) AskStream(ctx context.Context, input string, emit func(Event)) e
 		}
 	}
 
-	// Exhausted the tool budget. End the turn cleanly instead of hanging.
+	// Exhausted the tool budget — end the turn cleanly instead of hanging.
 	emit(Event{Kind: EventToken, Text: "I got stuck trying to use my tools. Could you rephrase that?"})
 	emit(Event{Kind: EventDone})
 	return nil
 }
 
-// runToolCall executes one tool call. Unknown tools and tool errors are turned
-// into messages the model can read and recover from — never a crash. The error
-// text lists the real tools so the model can correct itself.
+// runToolCall executes one tool call. Errors become messages the model can read
+// and recover from (never a crash); the text lists the real tools so it can correct itself.
 func (a *Agent) runToolCall(ctx context.Context, call ToolCall) string {
 	_, span := tracer.Start(ctx, "tool."+call.Function.Name)
 	defer span.End()

@@ -32,9 +32,8 @@ type Event struct {
 	Result string    `json:"result,omitempty"` // tool result text
 }
 
-// server wraps a single shared Agent. There is one conversation, so we serialize
-// turns with a mutex: this protects the Agent's history from a double-click race
-// and matches the semantics of one chat at a time.
+// server wraps one shared Agent. With a single conversation we serialize turns
+// with a mutex, protecting agent.history from a double-click race.
 type server struct {
 	agent *Agent
 	mu    sync.Mutex
@@ -69,7 +68,7 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	enc := json.NewEncoder(w) // Encode appends '\n', giving us NDJSON for free.
 	emit := func(ev Event) {
 		_ = enc.Encode(ev)
-		flusher.Flush() // push each event to the browser as it happens
+		flusher.Flush()
 	}
 
 	// r.Context() is cancelled if the user closes the tab, which stops the turn.
@@ -109,9 +108,8 @@ func (s *server) routes() http.Handler {
 	return mux
 }
 
-// serveHTTP runs the web chat. It binds to addr (default localhost only): the
-// read_file tool acts for anyone who can reach the port, so we do not expose it
-// on the network by default.
+// serveHTTP runs the web chat. It binds localhost by default: read_file acts for
+// anyone who can reach the port, so we don't expose it on the network.
 func serveHTTP(agent *Agent, addr string) error {
 	s := &server{agent: agent}
 	fmt.Printf("Web chat on http://%s — open it in your browser. Ctrl-C to quit.\n", addr)

@@ -12,9 +12,7 @@ import (
 	"time"
 )
 
-// ToolSpec is the definition we hand to the model so it knows a tool exists.
-// It follows the JSON-schema "function" shape that Ollama (and most LLM APIs)
-// expect.
+// ToolSpec follows the JSON-schema "function" shape Ollama expects for tools.
 type ToolSpec struct {
 	Type     string       `json:"type"` // always "function"
 	Function ToolFunction `json:"function"`
@@ -26,14 +24,11 @@ type ToolFunction struct {
 	Parameters  map[string]any `json:"parameters"` // JSON schema for the args
 }
 
-// Tool couples a definition (what the model sees) with an implementation
-// (the Go code we run when the model calls it).
 type Tool struct {
 	Spec ToolSpec
 	Run  func(args map[string]any) (string, error)
 }
 
-// Toolbox is a name-indexed registry of tools.
 type Toolbox struct {
 	tools map[string]Tool
 }
@@ -46,7 +41,6 @@ func NewToolbox(tools ...Tool) *Toolbox {
 	return &Toolbox{tools: m}
 }
 
-// Specs returns every tool definition, to send to the model.
 func (tb *Toolbox) Specs() []ToolSpec {
 	specs := make([]ToolSpec, 0, len(tb.tools))
 	for _, t := range tb.tools {
@@ -55,7 +49,6 @@ func (tb *Toolbox) Specs() []ToolSpec {
 	return specs
 }
 
-// Names returns the registered tool names (sorted), for banners and errors.
 func (tb *Toolbox) Names() []string {
 	names := make([]string, 0, len(tb.tools))
 	for name := range tb.tools {
@@ -65,7 +58,6 @@ func (tb *Toolbox) Names() []string {
 	return names
 }
 
-// Run executes the named tool with the given arguments.
 func (tb *Toolbox) Run(name string, args map[string]any) (string, error) {
 	t, ok := tb.tools[name]
 	if !ok {
@@ -74,8 +66,6 @@ func (tb *Toolbox) Run(name string, args map[string]any) (string, error) {
 	return t.Run(args)
 }
 
-// calculatorTool performs basic arithmetic — something small models get wrong
-// surprisingly often, which makes it a perfect first tool.
 func calculatorTool() Tool {
 	return Tool{
 		Spec: ToolSpec{
@@ -129,8 +119,6 @@ func runCalculator(args map[string]any) (string, error) {
 	return fmt.Sprintf("%v", result), nil
 }
 
-// currentTimeTool reports the current time — something the model can't know on
-// its own. It takes no arguments.
 func currentTimeTool() Tool {
 	return Tool{
 		Spec: ToolSpec{
@@ -207,7 +195,6 @@ func readFileInDir(baseDir, rel string) (string, error) {
 	}
 	defer f.Close()
 
-	// Bounded read: never pull more than maxFileBytes into memory.
 	data, err := io.ReadAll(io.LimitReader(f, maxFileBytes))
 	if err != nil {
 		return "", fmt.Errorf("reading file: %w", err)
@@ -215,9 +202,8 @@ func readFileInDir(baseDir, rel string) (string, error) {
 	return string(data), nil
 }
 
-// toFloat coerces a JSON-decoded value into a float64. JSON numbers decode to
-// float64, but models often send numbers as strings ("10"), so we accept those
-// too — coercing loosely-typed model output is a normal part of tool hardening.
+// toFloat coerces a JSON value to float64. Models often send numbers as
+// strings ("10"), so we accept those too.
 func toFloat(v any) (float64, bool) {
 	switch n := v.(type) {
 	case float64:
